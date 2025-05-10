@@ -1,6 +1,8 @@
+
 import torch
 import torch.nn as nn
 import torchvision
+from torchvision.models import VGG16_Weights
 import math
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -120,7 +122,8 @@ def boxes_to_transformation_targets(ground_truth_boxes, anchors_or_proposals):
 def sample_positive_negative(labels, positive_count, total_count):
     positive = torch.where(labels >= 1)[0]
     negative = torch.where(labels == 0)[0]
-    num_pos = min(positive.numel(), num_pos)
+    # Fix: Changed num_pos to positive_count
+    num_pos = min(positive.numel(), positive_count)
     num_neg = total_count - num_pos
     num_neg = min(negative.numel(), num_neg)
     perm_positive_idxs = torch.randperm(positive.numel(), device=positive.device)[:num_pos]
@@ -133,6 +136,19 @@ def sample_positive_negative(labels, positive_count, total_count):
     sampled_neg_idx_mask[neg_idxs] = True
     return sampled_neg_idx_mask, sampled_pos_idx_mask
 
+def transform_boxes_to_original_size(boxes, new_size, original_size):
+    ratio = [
+        torch.tensor(s_orig, dtype=torch.float32, device=boxes.device) / torch.tensor(s, dtype=torch.float32, device=boxes.device)
+        for s, s_orig in zip(new_size, original_size)
+    ]
+    ratio_height, ratio_width = ratio
+    xmin, ymin, xmax, ymax = boxes.unbind(1)
+    xmin = xmin * ratio_width
+    xmax = xmax * ratio_width
+    ymin = ymin * ratio_height
+    ymax = ymax * ratio_height
+    return torch.stack((xmin, ymin, xmax, ymax), dim=1)
+
 class RegionPropsalNetwork(nn.Module):
     def __init__(self, in_channels=512):
         super(RegionPropsalNetwork, self).__init__()
@@ -140,8 +156,8 @@ class RegionPropsalNetwork(nn.Module):
         self.aspect_ratios = [0.5, 1, 2]
         self.num_anchors = len(self.scales) * len(self.aspect_ratios)
         
-        # 3*3 conv
-        self.rpn_conv = nn.Conv2d(in_channels, in_channels, 512, kernel_size=3,stride=1, padding=1)
+        # 3*3 conv - Fixed kernel_size typo from 512 to 3
+        self.rpn_conv = nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=1, padding=1)
         
         # 1*1 clasification
         self.cls_layer = nn.Conv2d(in_channels, self.num_anchors * 2, kernel_size=1, stride=1)
@@ -194,7 +210,8 @@ class RegionPropsalNetwork(nn.Module):
     def filter_proposals(self, proposals, cls_scores, image_shape):
         # Pre NMS Filtering
         cls_scores = cls_scores.reshape(-1)
-        cls_scores = cls_scores.sigmoid(cls_scores)
+        # Fixed: Removed duplicate sigmoid call
+        cls_scores = cls_scores.sigmoid()
         _, top_n_idx = cls_scores.topk(10000)
         cls_scores = cls_scores[top_n_idx]
         proposals = proposals[top_n_idx]
@@ -203,7 +220,6 @@ class RegionPropsalNetwork(nn.Module):
         proposals = clamp_boxes_to_image_boundary(proposals, image_shape)
         
         # NMS Based on objectness
-        keep_mask = torch.zeros_like(cls_scores, dtype=torch.bool)
         keep_indices = torch.ops.torchvision.nms(
             proposals, cls_scores, 0.7)
         
@@ -261,33 +277,47 @@ class RegionPropsalNetwork(nn.Module):
     
     def forward(self, image, feat, target):
         # Call RPN Layers
-        rpn_feat = nn.ReLU()(self.rpn_conv(feat))
+        rpn_feat = nn.functional.relu(self.rpn_conv(feat))
         cls_scores = self.cls_layer(rpn_feat)
         box_transform_pred = self.bbox_reg_layer(rpn_feat)
-        
-        # Genarate anchors
+    
+    # Generate anchors
         anchors = self.generate_anchors(image, feat)
-        
-        # cls_scores -> (Batch, Numbers of Anchors per location, H_feat, W_feat)
-        number_of_anchors_per_location = cls_scores.size(1)
-        cls_scores = cls_scores.permute(0, 2, 3, 1)
-        cls_scores = cls_scores.reshape(-1, 1)
-        # cls_scores -> (Batch * H_feat * W_feat * num_anchors_per_location, 1)
-        
-        # box_transform_pred -> (Batch, Numbers of Anchors per location * 4, H_feat, W_feat)
+    
+    # Get dimensions for reshaping
+        batch_size = feat.size(0)
+        feat_h, feat_w = feat.shape[-2:]
+    
+    # cls_scores -> (Batch, Numbers of Anchors per location * 2, H_feat, W_feat)
+        number_of_anchors_per_location = cls_scores.size(1) // 2  # Divide by 2 for foreground/background
+    
+    # Reshape cls_scores to get one score per anchor
+        cls_scores = cls_scores.view(batch_size, 2, number_of_anchors_per_location, feat_h, feat_w)
+        cls_scores = cls_scores.permute(0, 2, 3, 4, 1)  # [batch, anchors_per_loc, h, w, 2]
+        cls_scores = cls_scores.reshape(batch_size, -1, 2)  # [batch, num_anchors, 2]
+        cls_scores = cls_scores.reshape(-1, 2)[:, 0:1]  # Take foreground score
+    
+    # Reshape box_transform_pred to get one prediction per anchor
         box_transform_pred = box_transform_pred.view(
-            box_transform_pred.size(0),
+            batch_size,
             number_of_anchors_per_location,
             4,
-            rpn_feat.shape[-2],
-            rpn_feat.shape[-2],
+            feat_h,
+            feat_w
         )
-        
-        box_transform_pred = box_transform_pred.permute(0, 3, 4, 1, 2)
-        box_transform_pred = box_transform_pred.reshape(-1, 4)
-        # box_transform_pred -> (Batch * H_feat * W_feat * num_anchors_per_location, 4)
-        
-        # Transform genarated anchors according to box_transform_pred
+        box_transform_pred = box_transform_pred.permute(0, 1, 3, 4, 2)  # [batch, anchors_per_loc, h, w, 4]
+        box_transform_pred = box_transform_pred.reshape(batch_size, -1, 4)  # [batch, num_anchors, 4]
+        box_transform_pred = box_transform_pred.reshape(-1, 4)  # [batch*num_anchors, 4]
+    
+    # Make sure anchors match the batch size
+    # If we have multiple images in the batch, repeat anchors for each image
+        if batch_size > 1:
+            anchors = anchors.repeat(batch_size, 1)
+    
+    # Now the number of anchors should match the number of box transformations
+        assert anchors.size(0) == box_transform_pred.size(0), f"Anchor count ({anchors.size(0)}) doesn't match box transform count ({box_transform_pred.size(0)})"
+    
+    # Transform generated anchors according to box_transform_pred
         proposals = apply_regression_pred_to_anchors_or_proposals(
             box_transform_pred.detach().reshape(-1, 1, 4),
             anchors
@@ -296,7 +326,7 @@ class RegionPropsalNetwork(nn.Module):
         proposals, scores = self.filter_proposals(
             proposals, cls_scores, image.shape
         )
-        
+    
         rpn_output = {
             'proposals': proposals,
             'scores': scores,
@@ -307,12 +337,16 @@ class RegionPropsalNetwork(nn.Module):
         else:
             # in training
             # Assign gt box and label for each anchor
+            # FIX: Handle target as a list of dictionaries
+            # Get the bboxes from the first item in the target list
+            target_bboxes = target[0]['bboxes'] if isinstance(target, list) else target['bboxes']
+            
             labels_for_anchors, matched_gt_boxes_for_anchors = self.assign_targets_to_anchors(
                 anchors,
-                target['bboxes'][0]
+                target_bboxes
             )
             
-            # Based on gt assifnment above, get regression targets for anchors
+            # Based on gt assignment above, get regression targets for anchors
             # matched_gt_boxes_for_anchors -> (num_anchors in image, 4)
             # anchors -> (num_anchors in image, 4)
             regression_targets = boxes_to_transformation_targets(
@@ -326,14 +360,14 @@ class RegionPropsalNetwork(nn.Module):
                 total_count=256
             )
             sampled_idxs = torch.where(sampled_neg_idx_mask | sampled_pos_idx_mask)[0]
-            localization_loss = {
-                torch.nn.functional.smooth_l1_loss(
-                    box_transform_pred[sampled_pos_idx_mask],
-                    regression_targets[sampled_pos_idx_mask],
-                    beta=1 / 9,
-                    reduction='sum'
-                ) / (sampled_idxs.numel())
-            }
+            
+            # Fixed: Removed the dictionary wrapping for localization_loss
+            localization_loss = torch.nn.functional.smooth_l1_loss(
+                box_transform_pred[sampled_pos_idx_mask],
+                regression_targets[sampled_pos_idx_mask],
+                beta=1 / 9,
+                reduction='sum'
+            ) / (sampled_idxs.numel())
             
             cls_loss = torch.nn.functional.binary_cross_entropy_with_logits(
                 cls_scores[sampled_idxs].flatten(),
@@ -347,10 +381,11 @@ class RegionPropsalNetwork(nn.Module):
         
 class ROIHead(nn.Module):
     def __init__(self, num_classes=21, in_channels=512):
-        super(ROIHead, self).__int__()
+        # Fixed: Changed __int__ to __init__
+        super().__init__()
         self.num_classes = num_classes
-        self.pool_size=7
-        self.fc_inner_dim=1024
+        self.pool_size = 7
+        self.fc_inner_dim = 1024
         
         self.fc6 = nn.Linear(in_channels * self.pool_size * self.pool_size, self.fc_inner_dim)
         self.fc7 = nn.Linear(self.fc_inner_dim, self.fc_inner_dim)
@@ -372,11 +407,43 @@ class ROIHead(nn.Module):
         labels[background_proposals] = 0
         return labels, matched_gt_boxes_for_proposals
         
+    def filter_predictions(self, pred_boxes, pred_labels, pred_scores):
+        # remove low scoring boxes
+        keep = torch.where(pred_scores > 0.05)[0]
+        pred_boxes, pred_scores, pred_labels = pred_boxes[keep], pred_scores[keep], pred_labels[keep]
+        
+        # remove small boxes
+        min_size = 1
+        ws, hs = pred_boxes[:, 2] - pred_boxes[:, 0], pred_boxes[:, 3] - pred_boxes[:, 1]
+        keep = (ws >= min_size) & (hs >= min_size)
+        keep = torch.where(keep)[0]
+        pred_boxes, pred_scores, pred_labels = pred_boxes[keep], pred_scores[keep], pred_labels[keep]
+        
+        # class wise nms
+        keep_mask = torch.zeros_like(pred_scores, dtype=torch.bool)
+        for class_id in torch.unique(pred_labels):
+            curr_indices = torch.where(pred_labels == class_id)[0]
+            curr_keep_indices = torch.ops.torchvision.nms(
+                pred_boxes[curr_indices],
+                pred_scores[curr_indices],
+                0.5,
+            )
+            keep_mask[curr_indices[curr_keep_indices]] = True
+        keep_indices = torch.where(keep_mask)[0]
+        post_nms_keep_indices = keep_indices[pred_scores[keep_indices].sort(
+            descending=True
+            )[1]]
+        keep = post_nms_keep_indices[:100]
+        pred_boxes, pred_scores, pred_labels = pred_boxes[keep], pred_scores[keep], pred_labels[keep]
+        return pred_boxes, pred_scores, pred_labels   
         
     def forward(self, image, proposals, feat, target):
         if self.training and target is not None:
-            gt_boxes = target['bboxes'][0]
-            gt_labels = target['labels'][0]
+            # FIX: Handle target as a list of dictionaries
+            # Get the bboxes and labels from the first item in the target list
+            gt_boxes = target[0]['bboxes'] if isinstance(target, list) else target['bboxes']
+            gt_labels = target[0]['labels'] if isinstance(target, list) else target['labels']
+            
             # assign labels and gt boxes for proposals
             labels, matched_gt_boxes_for_proposals = self.assign_target_to_proposals(
                 proposals, gt_boxes, gt_labels
@@ -395,23 +462,31 @@ class ROIHead(nn.Module):
             )
             # regression_targets -> (sampled_training_proposal, 4)
             
-            # ROI pooling part
-            # spatial scale for roi pooling
-            # For vgg16 this would be 1/16
-            spatial_scale = 0.0625\
+        # ROI pooling part
+        # spatial scale for roi pooling
+        # For vgg16 this would be 1/16
+        spatial_scale = 0.0625
+        
+        # Added missing ROI pooling implementation
+        proposal_roi_pool_feats = torchvision.ops.roi_pool(
+            feat, 
+            [proposals.detach()], 
+            output_size=(self.pool_size, self.pool_size),
+            spatial_scale=spatial_scale
+        )
                 
-            proposal_roi_pool_feats = proposal_roi_pool_feats.flatten(start_dim=1)
-            box_fc_6 = torch.nn.functional.relu(self.fc6(proposal_roi_pool_feats))
-            box_fc_7 = torch.nn.functional.relu(self.fc7(box_fc_6)) 
-            cls_scores = self.cls_layer(box_fc_7)
-            box_transform_pred = self.bbox_reg_layer(box_fc_7)
+        proposal_roi_pool_feats = proposal_roi_pool_feats.flatten(start_dim=1)
+        box_fc_6 = torch.nn.functional.relu(self.fc6(proposal_roi_pool_feats))
+        box_fc_7 = torch.nn.functional.relu(self.fc7(box_fc_6)) 
+        cls_scores = self.cls_layer(box_fc_7)
+        box_transform_pred = self.bbox_reg_layer(box_fc_7)
             
-            num_boxes, num_classes = cls_scores.shape
-            box_transform_pred = box_transform_pred.reshape(
+        num_boxes, num_classes = cls_scores.shape
+        box_transform_pred = box_transform_pred.reshape(
                 num_boxes, num_classes, 4
             )
-            frcnn_output = {}
-            if self.training and targets is not None:
+        frcnn_output = {}
+        if self.training and target is not None:
                 classification_loss = torch.nn.functional.cross_entropy(
                     cls_scores,
                     labels
@@ -431,7 +506,7 @@ class ROIHead(nn.Module):
                 frcnn_output['frcnn_classification_loss'] = classification_loss
                 frcnn_output['frcnn_localization_loss'] = localization_loss
                 return frcnn_output
-            else:
+        else:
                 # Apply transformation prediction to proposals
                 pred_boxes = apply_regression_pred_to_anchors_or_proposals(
                     box_transform_pred, proposals
@@ -451,11 +526,200 @@ class ROIHead(nn.Module):
                 pred_labels = pred_labels[:, 1:]
                 # pred_boxes -> (num_proposals, num_classes-1, 4)
                 
-                # Batch everything by making every class prediction a separete
-                # insrtance
+                # Batch everything by making every class prediction a separate
+                # instance
                 
                 pred_boxes = pred_boxes.reshape(-1, 4)
                 pred_scores = pred_scores.reshape(-1)
                 pred_labels = pred_labels.reshape(-1)
                 
+                pred_boxes, pred_scores, pred_labels = self.filter_predictions(
+                    pred_boxes, pred_labels, pred_scores
+                )
+                frcnn_output['boxes'] = pred_boxes
+                frcnn_output['scores'] = pred_scores
+                frcnn_output['labels'] = pred_labels
+                return frcnn_output
                 
+class FasterRCNN(nn.Module):
+    def __init__(self, num_classes=21):
+        super(FasterRCNN, self).__init__()
+        vgg16 = torchvision.models.vgg16(weights=torchvision.models.VGG16_Weights.IMAGENET1K_V1)  # Updated weights parameter
+        self.backbone = vgg16.features[:-1]
+        self.rpn = RegionPropsalNetwork(in_channels=512)
+        self.roi_head = ROIHead(num_classes=num_classes) 
+            
+        for layer in self.backbone[:10]:
+            for p in layer.parameters():
+                p.requires_grad = False
+        self.image_mean = [0.485, 0.456, 0.406]
+        self.image_std = [0.229, 0.224, 0.225]
+        self.min_size = 600
+        self.max_size = 1000
+        
+    def normalize_resize_image_and_boxes(self, image, bboxes):
+    # Normalize
+        mean = torch.as_tensor(self.image_mean,
+                           dtype=image.dtype,
+                           device=image.device)
+        std = torch.as_tensor(self.image_std,
+                         dtype=image.dtype,
+                         device=image.device)
+        image = (image - mean[:, None, None]) / std[:, None, None]
+    ##########
+    
+    # Resize such that lower dim is scaled to 600
+    # but larger dim not more than 1000
+        h,w = image.shape[-2:]
+        im_shape = torch.tensor(image.shape[-2:])
+        min_size = torch.min(im_shape).to(dtype=torch.float32)
+        max_size = torch.max(im_shape).to(dtype=torch.float32)
+        scale = torch.min(
+            float(self.min_size) / min_size,
+            float(self.max_size) / max_size
+        )
+        scale_factor = scale.item()
+    # Resize image based on scale
+        image = torch.nn.functional.interpolate(
+            image,
+            size=None,
+            scale_factor=scale_factor,
+            mode='bilinear',
+            recompute_scale_factor=True,
+            align_corners=False,
+        )
+    
+    # Resize bboxes
+        if bboxes is not None:
+        # Check the shape of bboxes to determine how to process it
+            if len(bboxes.shape) == 3:  # [batch, num_boxes, coords]
+            # Check if we have 4 coordinates per box
+                if bboxes.shape[2] == 4:  # Standard [x1, y1, x2, y2] format
+                    ratios = [
+                        torch.tensor(s, dtype=torch.float32, device=bboxes.device) / torch.tensor(s_orig, dtype=torch.float32, device=bboxes.device)
+                        for s, s_orig in zip(image.shape[-2:], (h, w))
+                    ]
+                    ratio_height, ratio_width = ratios
+                
+                # Process each box in the batch
+                    resized_bboxes = []
+                    for batch_boxes in bboxes:
+                        xmin, ymin, xmax, ymax = batch_boxes.unbind(1)
+                        xmin = xmin * ratio_width
+                        xmax = xmax * ratio_width
+                        ymin = ymin * ratio_height
+                        ymax = ymax * ratio_height
+                        resized_batch_boxes = torch.stack((xmin, ymin, xmax, ymax), dim=1)
+                        resized_bboxes.append(resized_batch_boxes)
+                
+                    bboxes = torch.stack(resized_bboxes)
+                else:  # Non-standard format, print debug info
+                    print(f"Warning: Unexpected bounding box format. Shape: {bboxes.shape}")
+                # Try to handle [batch, num_boxes, 2] format (might be [center_x, center_y, width, height])
+                    if bboxes.shape[2] == 2:
+                    # This is likely a different format, let's print it for debugging
+                        print("Bounding box values (first few):", bboxes[0, :2])
+                    # For now, return the original bboxes
+                        return image, bboxes
+            elif len(bboxes.shape) == 2:  # [num_boxes, coords]
+            # Similar handling for 2D tensor
+                ratios = [
+                    torch.tensor(s, dtype=torch.float32, device=bboxes.device) / torch.tensor(s_orig, dtype=torch.float32, device=bboxes.device)
+                    for s, s_orig in zip(image.shape[-2:], (h, w))
+                ]
+                ratio_height, ratio_width = ratios
+            
+            # Check if we have 4 coordinates per box
+                if bboxes.shape[1] == 4:  # Standard [x1, y1, x2, y2] format
+                    xmin, ymin, xmax, ymax = bboxes.unbind(1)
+                    xmin = xmin * ratio_width
+                    xmax = xmax * ratio_width
+                    ymin = ymin * ratio_height
+                    ymax = ymax * ratio_height
+                    bboxes = torch.stack((xmin, ymin, xmax, ymax), dim=1)
+                else:  # Non-standard format, print debug info
+                    print(f"Warning: Unexpected bounding box format. Shape: {bboxes.shape}")
+                # Try to handle [num_boxes, 2] format
+                    if bboxes.shape[1] == 2:
+                        print("Bounding box values (first few):", bboxes[:2])
+                    # For now, return the original bboxes
+                        return image, bboxes
+        
+            return image, bboxes
+        return image, None
+          
+    def forward(self, image, target=None):
+        old_shape = image.shape[-2:]
+        if self.training:
+            # FIX: Handle target as a list of dictionaries
+            if target is not None and isinstance(target, list):
+                # Normalize and resize boxes for each image in the batch
+                image_list = []
+                target_list = []
+                
+                for i, (img, tgt) in enumerate(zip(image, target)):
+                    img_resized, bboxes_resized = self.normalize_resize_image_and_boxes(img.unsqueeze(0), tgt['bboxes'].unsqueeze(0))
+                    image_list.append(img_resized.squeeze(0))
+                    
+                    # Update the target with resized bboxes
+                    tgt_resized = tgt.copy()
+                    tgt_resized['bboxes'] = bboxes_resized.squeeze(0)
+                    target_list.append(tgt_resized)
+                
+                # Stack images back into a batch
+                image = torch.stack(image_list)
+                target = target_list
+            else:
+                # Handle single target case (for backward compatibility)
+                image, bboxes = self.normalize_resize_image_and_boxes(image, target['bboxes'])
+                if target is not None:
+                    target['bboxes'] = bboxes
+        else:
+            image, _ = self.normalize_resize_image_and_boxes(image, None)
+            
+        # Call backbone
+        feat = self.backbone(image)
+        
+        # Call RPN and get proposals
+        rpn_output = self.rpn(image, feat, target)
+        proposals = rpn_output['proposals']
+        
+        # Call ROI head and convert proposals to boxes
+        frcnn_output = self.roi_head(image, proposals, feat, target)
+        
+        if not self.training:
+            # transform boxes to original image dimension
+            frcnn_output['boxes'] = transform_boxes_to_original_size(
+                frcnn_output['boxes'], image.shape[-2:], old_shape
+            )
+        return rpn_output, frcnn_output
+
+# Example usage
+def test_model():
+    # Create a dummy image and target
+    image = torch.randn(1, 3, 800, 800)
+    target = {
+        'bboxes': torch.tensor([[[100, 100, 200, 200], [300, 300, 400, 400]]], dtype=torch.float32),
+        'labels': torch.tensor([[1, 2]], dtype=torch.int64)
+    }
+    
+    # Initialize model
+    model = FasterRCNN(num_classes=21)
+    model.eval()  # Set to evaluation mode
+    
+    # Forward pass
+    with torch.no_grad():
+        rpn_output, frcnn_output = model(image)
+    
+    print("RPN output keys:", rpn_output.keys())
+    print("Number of proposals:", rpn_output['proposals'].shape)
+    
+    if 'boxes' in frcnn_output:
+        print("FRCNN output - detected boxes:", frcnn_output['boxes'].shape)
+        print("FRCNN output - scores:", frcnn_output['scores'].shape)
+        print("FRCNN output - labels:", frcnn_output['labels'].shape)
+    
+    return "Model test completed successfully"
+
+# Uncomment to test
+# test_model()
